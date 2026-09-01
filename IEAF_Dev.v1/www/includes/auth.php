@@ -2,56 +2,58 @@
 /**
  * includes/auth.php — Production Authentication
  *
- * Reads mod_auth_mellon attributes using the confirmed working pattern
- * from index.php. Tries $_SERVER['MELLON_*'] first, then falls back to
- * $_SERVER['HTTP_MELLON_*'] (which is how this server passes them).
+ * Attribute map confirmed from debug.php on iaef.isg.siue.edu:
  *
- * No loopback HTTP call. No infinite loop possible.
- * Apache's MellonEnable "info" is sufficient — PHP handles the redirect
- * with the auth_attempted loop guard.
+ *   MELLON_email       → user's SIUE email  (NOT emailaddress)
+ *   MELLON_givenname   → first name
+ *   MELLON_surname     → last name
+ *   MELLON_siueId      → SIUE ID number
+ *   MELLON_NAME_ID     → email (reliable fallback)
+ *   REMOTE_USER        → username@siue.edu  (ultimate fallback)
+ *
+ * MellonEnable "info" is kept in Apache config.
+ * PHP handles the auth redirect with auth_attempted loop guard.
  */
 
 require_once '/proj/config/db.php';
 
-/**
- * Read Entra ID attributes from mod_auth_mellon.
- * Returns null if no Mellon session exists (user not authenticated).
- */
 function fetch_userinfo(): ?array {
-    // Try direct env vars first, then HTTP_ prefixed fallback
-    // (this server passes them as HTTP_ headers)
+    // Email — confirmed key is MELLON_email (not MELLON_emailaddress)
     $email = strtolower(trim(
-        $_SERVER['MELLON_emailaddress']     ??
-        $_SERVER['HTTP_MELLON_EMAILADDRESS'] ?? ''
+        $_SERVER['MELLON_email']     ??
+        $_SERVER['MELLON_NAME_ID']   ??
+        $_SERVER['REMOTE_USER']      ?? ''
     ));
 
+    // First name
     $given = trim(
-        $_SERVER['MELLON_givenname']     ??
+        $_SERVER['MELLON_givenname'] ??
         $_SERVER['HTTP_MELLON_GIVENNAME'] ?? ''
     );
 
+    // Last name
     $surname = trim(
-        $_SERVER['MELLON_surname']     ??
+        $_SERVER['MELLON_surname'] ??
         $_SERVER['HTTP_MELLON_SURNAME'] ?? ''
     );
 
+    // Object ID — full URI form with slashes → underscores
     $oid = trim(
-        $_SERVER['MELLON_objectid']     ??
-        $_SERVER['HTTP_MELLON_OBJECTID'] ?? ''
+        $_SERVER['MELLON_http://schemas_microsoft_com/identity/claims/objectidentifier'] ??
+        $_SERVER['MELLON_objectid'] ?? ''
     );
 
-    // Build full name — fall back to sAMAccountName or REMOTE_USER if needed
+    // SIUE ID
+    $siue_id = trim($_SERVER['MELLON_siueId'] ?? '');
+
+    // Build display name
     $full_name = trim("$given $surname");
     if (!$full_name) {
-        $full_name = trim(
-            $_SERVER['MELLON_sAMAccountName'] ??
-            $_SERVER['HTTP_MELLON_SAMACCOUNTNAME'] ??
-            $_SERVER['REMOTE_USER'] ?? ''
-        );
+        // Fall back to the part of REMOTE_USER before the @
+        $full_name = explode('@', $email)[0] ?? '';
     }
 
-    // If we have neither a name nor an email, user is not authenticated
-    if (!$full_name && !$email) {
+    if (!$email) {
         return null;
     }
 
@@ -60,19 +62,15 @@ function fetch_userinfo(): ?array {
         'givenname'    => $given,
         'surname'      => $surname,
         'objectid'     => $oid,
+        'siue_id'      => $siue_id,
         'full_name'    => $full_name,
     ];
 }
 
-/**
- * Look up or auto-provision the user in MariaDB.
- * Every authenticated Entra ID account is created as 'student' on first login.
- */
 function find_or_create_user(array $attrs): ?array {
     $pdo   = db();
     $email = $attrs['emailaddress'];
 
-    // If no email, use full_name as a unique key fallback
     if (!$email) {
         error_log("AUTH: No email in Mellon attrs — cannot provision user.");
         return null;
@@ -87,6 +85,7 @@ function find_or_create_user(array $attrs): ?array {
             error_log("AUTH: Blocked inactive account: $email");
             return null;
         }
+        // Keep name current
         $pdo->prepare(
             'UPDATE users SET given_name=?, surname=?, entra_oid=?, updated_at=NOW()
              WHERE user_id=?'
@@ -96,7 +95,9 @@ function find_or_create_user(array $attrs): ?array {
             $attrs['objectid']  ?: $user['entra_oid'],
             $user['user_id'],
         ]);
-        return $user;
+        // Re-fetch updated row
+        $stmt->execute([$email]);
+        return $stmt->fetch(PDO::FETCH_ASSOC);
     }
 
     // Auto-provision new user as student
@@ -114,30 +115,19 @@ function find_or_create_user(array $attrs): ?array {
     return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
 }
 
-/**
- * Redirect to Mellon login with loop guard.
- * Adds ?auth_attempted=1 so if it fails again we show an error
- * instead of looping forever.
- */
 function require_login(): never {
     if (!isset($_GET['auth_attempted'])) {
-        $return_to = urlencode(($_SERVER['REQUEST_URI'] ?? '/') . '?auth_attempted=1');
-        header('Location: /mellon/login?ReturnTo=' . $return_to);
+        $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+        // Append auth_attempted to ReturnTo so we catch loops
+        $sep    = str_contains($uri, '?') ? '&' : '?';
+        header('Location: /mellon/login?ReturnTo=' . urlencode($uri . $sep . 'auth_attempted=1'));
     } else {
         http_response_code(403);
-        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-              <title>Authentication Error</title></head><body>
-              <h1>Authentication Error</h1>
-              <p>Unable to retrieve your session attributes after login.</p>
-              <p><a href="/mellon/login?ReturnTo=/">Try again</a></p>
-              </body></html>';
+        include __DIR__ . '/../views/403_auth.php';
     }
     exit;
 }
 
-/**
- * Enforce role access. Shows 403 page if role is insufficient.
- */
 function require_role(string ...$roles): void {
     global $CURRENT_USER;
     if (!$CURRENT_USER || !in_array($CURRENT_USER['role'], $roles, true)) {
@@ -159,7 +149,6 @@ if ($attrs) {
     $CURRENT_USER = find_or_create_user($attrs);
 }
 
-// If still no user, send to login (with loop guard)
 if (!$CURRENT_USER && !str_starts_with($_SERVER['REQUEST_URI'] ?? '', '/mellon')) {
     require_login();
 }
